@@ -49,8 +49,8 @@ def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, 
         # 3.1 时间特征：每条边的时间转移向量 [num_edges, time_slots]
         edge_time_attr = torch.zeros(num_edges, time_slots, device=device)
         for i in range(num_edges):
-            # 随机选择几个时间点设置为1
-            active_slots = torch.randint(0, time_slots, (3,), device=device)
+            # 随机选择2个时间点（两个点之间有转移）设置为1
+            active_slots = torch.randint(0, time_slots, (2,), device=device)
             edge_time_attr[i, active_slots] = 1.0
         
         # 3.2 创建频率和距离
