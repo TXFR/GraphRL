@@ -1,0 +1,7 @@
+torch>=1.9.0
+torch-geometric>=2.0.0
+torch-scatter>=2.0.9
+torch-sparse>=0.6.12
+numpy>=1.19.5
+scikit-learn>=0.24.2
+tqdm>=4.62.3

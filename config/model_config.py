@@ -53,6 +53,15 @@ class ModelConfig:
     map_beta: float = 10.0
     map_gamma: float = 0.9
 
+    # Self-supervised Learning Parameters
+    ssl_mode: str = "none"  # "none", "contrastive", "reconstruction", "combined"
+    ssl_temperature: float = 0.5
+    ssl_mask_ratio: float = 0.15
+    ssl_queue_size: int = 65536
+    ssl_momentum: float = 0.999
+    ssl_weight: float = 1.0
+    supervised_weight: float = 0.1
+
     def __post_init__(self):
         """Initialize derived parameters and validate configuration"""
         # Set derived parameters based on actual meanings

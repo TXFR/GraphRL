@@ -11,6 +11,7 @@ from torch import nn
 from sklearn.preprocessing import PowerTransformer
 
 '''
+This is a pre-training for constructing nodes embedding.
 计算geo_cells之间的空间位置关系和语义特征（源于格网中的POI）
 两个点之间有边则说明它们在空间上存在一定关系（有关联）
 则它们在低维空间上的特征编码应该是相似的

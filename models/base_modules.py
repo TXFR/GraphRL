@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import global_mean_pool as gmp
-from torch_geometric.nn.models import GAT
 from torch_geometric.nn import GENConv
 from torch_scatter import scatter_mean, scatter_softmax
 
@@ -186,24 +185,15 @@ class LocationEmbed(nn.Module):
             aux_info: Edge auxiliary information [num_edges, 2]
             batch: Batch indices [num_nodes]
         """
-        print("\nLocationEmbed forward pass:")
-        print(f"Input x shape: {x.shape}")
-        print(f"Edge index shape: {edge_index.shape}")
-        print(f"Aux info shape: {aux_info.shape}")
-        
         # 通过增强的GAT层
         x = self.conv1(x, edge_index, aux_info)
-        print(f"After conv1 shape: {x.shape}")
         x = F.relu(x)
         x = self.conv2(x, edge_index, aux_info)
-        print(f"After conv2 shape: {x.shape}")
         x = self.norm(x)
         
         # 全局池化和分类
         fusion = gmp(x, batch)
-        print(f"After pooling shape: {fusion.shape}")
         cls = self.cls_linear(fusion)
-        print(f"Output cls shape: {cls.shape}")
         
         return x, cls
 
@@ -227,30 +217,112 @@ class ContrastiveHead(nn.Module):
         """Project embeddings to contrastive space"""
         return self.projection(x)
 
-class TrajectoryReconstruction(nn.Module):
+class LinkPrediction(nn.Module):
     """
-    Trajectory reconstruction module for self-supervised learning.
+    Link prediction module for self-supervised learning on trajectory graphs.
 
-    Reconstructs trajectory sequences from corrupted inputs.
+    Performs link prediction task:
+    1. Randomly remove some edges from the trajectory graph
+    2. Predict whether edges exist between node pairs
+    3. This teaches the model to understand trajectory structure and spatio-temporal relationships
     """
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+    def __init__(self, node_dim: int, hidden_dim: int):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+
+        # Edge existence predictor
+        self.edge_predictor = nn.Sequential(
+            nn.Linear(node_dim * 2, hidden_dim),  # Concatenate source and target node features
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()  # Probability of edge existence
         )
 
-    def forward(self, x):
-        """Encode and reconstruct trajectory"""
-        encoded = self.encoder(x)
-        reconstructed = self.decoder(encoded)
-        return reconstructed
+    def forward(self, x, edge_index, batch):
+        """
+        Args:
+            x: Node features [num_nodes, node_dim]
+            edge_index: Edge indices [2, num_edges]
+            batch: Batch indices [num_nodes] (node-level batch indices)
+        Returns:
+            edge_pred: Predicted probabilities for edge existence
+            edge_labels: Ground truth edge labels (1 for existing, 0 for negative samples)
+        """
+        device = x.device
+        num_edges = edge_index.size(1)
+
+        # Positive edges prediction
+        src_nodes = x[edge_index[0]]  # [num_edges, node_dim]
+        dst_nodes = x[edge_index[1]]  # [num_edges, node_dim]
+        pos_edge_features = torch.cat([src_nodes, dst_nodes], dim=-1)  # [num_edges, node_dim * 2]
+        pos_edge_pred = self.edge_predictor(pos_edge_features)  # [num_edges, 1]
+
+        # Generate negative samples
+        negative_edges_list = []
+
+        # Strategy 1: Sample negative edges within the same graph (trajectory)
+        for i in range(num_edges):
+            src_node = edge_index[0, i].item()
+            src_batch = batch[src_node].item()
+
+            # Find all nodes in the same graph
+            same_graph_mask = batch == src_batch
+            same_graph_nodes = torch.where(same_graph_mask)[0]
+
+            # Remove source node and existing neighbors
+            available_nodes = same_graph_nodes[same_graph_nodes != src_node]
+            existing_neighbors = edge_index[1, edge_index[0] == src_node]
+            available_nodes = available_nodes[~torch.isin(available_nodes, existing_neighbors)]
+
+            if len(available_nodes) > 0:
+                # Sample one negative edge within the same graph
+                dst_node = available_nodes[torch.randint(0, len(available_nodes), (1,))].item()
+                negative_edges_list.append([src_node, dst_node])
+
+        # Strategy 2: Sample some negative edges across different graphs (optional)
+        # This helps learn that edges shouldn't exist between different trajectories
+        if len(negative_edges_list) < num_edges // 2:  # If we don't have enough intra-graph negatives
+            unique_batches = torch.unique(batch)
+            if len(unique_batches) > 1:
+                for _ in range(min(num_edges // 4, 10)):  # Sample a few cross-graph negatives
+                    # Randomly select two different graphs
+                    batch1, batch2 = unique_batches[torch.randperm(len(unique_batches))[:2]]
+
+                    # Sample one node from each graph
+                    nodes1 = torch.where(batch == batch1)[0]
+                    nodes2 = torch.where(batch == batch2)[0]
+
+                    if len(nodes1) > 0 and len(nodes2) > 0:
+                        src_node = nodes1[torch.randint(0, len(nodes1), (1,))].item()
+                        dst_node = nodes2[torch.randint(0, len(nodes2), (1,))].item()
+                        negative_edges_list.append([src_node, dst_node])
+
+        # Convert negative edges to tensor
+        if negative_edges_list:
+            negative_edges = torch.tensor(negative_edges_list, device=device).t()  # [2, num_negative]
+
+            # Get features for negative edges
+            neg_src_nodes = x[negative_edges[0]]  # [num_negative, node_dim]
+            neg_dst_nodes = x[negative_edges[1]]  # [num_negative, node_dim]
+            neg_edge_features = torch.cat([neg_src_nodes, neg_dst_nodes], dim=-1)  # [num_negative, node_dim * 2]
+
+            # Predict negative edge probabilities
+            neg_edge_pred = self.edge_predictor(neg_edge_features)  # [num_negative, 1]
+
+            # Combine positive and negative predictions
+            all_edge_pred = torch.cat([pos_edge_pred, neg_edge_pred], dim=0)
+            all_edge_labels = torch.cat([
+                torch.ones(pos_edge_pred.size(0), 1, device=device),  # Positive labels
+                torch.zeros(neg_edge_pred.size(0), 1, device=device)   # Negative labels
+            ], dim=0)
+
+            return all_edge_pred, all_edge_labels
+        else:
+            # Fallback: return only positive predictions
+            return pos_edge_pred, torch.ones_like(pos_edge_pred, device=device)
 
 class Spatio_Tmp_Embed(nn.Module):
     """
@@ -272,11 +344,12 @@ class Spatio_Tmp_Embed(nn.Module):
     """
     def __init__(self, embed_dim: int, hidden_channels: int,
                  fuse_num: int, t_l_embed: int, edge_attr_dim: int = 64,
-                 use_self_supervised: bool = True):
+                 ssl_mode: str = "none"):
         super(Spatio_Tmp_Embed, self).__init__()
 
         self.edge_attr_dim = edge_attr_dim
-        self.use_self_supervised = use_self_supervised
+        self.ssl_mode = ssl_mode
+        self.use_ssl = ssl_mode != "none"
         
         # 边特征编码层
         self.time_proj = nn.Linear(64, edge_attr_dim // 2)  # 从time_embed输出的64维特征
@@ -322,17 +395,16 @@ class Spatio_Tmp_Embed(nn.Module):
         self.norm = nn.LayerNorm(hidden_channels * 2)  # 两个节点的特征拼接
         self.fuse_linear = nn.Linear(hidden_channels * 2, t_l_embed)
 
-        # Self-supervised learning modules
-        if self.use_self_supervised:
+                    # Self-supervised learning modules - initialize all if SSL is enabled
+        if self.ssl_mode != "none":
             self.contrastive_head = ContrastiveHead(
                 embed_dim=hidden_channels,
                 hidden_dim=hidden_channels,
                 output_dim=128
             )
-            self.reconstruction_head = TrajectoryReconstruction(
-                input_dim=embed_dim,
-                hidden_dim=hidden_channels,
-                output_dim=embed_dim
+            self.link_prediction_head = LinkPrediction(
+                node_dim=embed_dim,
+                hidden_dim=hidden_channels
             )
 
     def forward(self, x, edge_index, edge_attr, batch):
@@ -343,26 +415,19 @@ class Spatio_Tmp_Embed(nn.Module):
             edge_attr: (time_attr, aux_info, pos)
             batch: Batch indices [num_nodes]
         """
-        print("\nSpatio_Tmp_Embed forward pass:")
-        print(f"x shape: {x.shape}")
-        print(f"edge_index shape: {edge_index.shape}")
-        
-        # 解包边属性
+      
+        # 解析边属性
         time_attr, aux_info, _ = edge_attr
-        print(f"time_attr shape: {time_attr.shape}")
-        print(f"aux_info shape: {aux_info.shape}")
         
         # 编码边特征
         time_feat = self.time_proj(time_attr)  # [num_edges, edge_attr_dim//2]
         aux_feat = self.aux_proj(aux_info)     # [num_edges, edge_attr_dim//2]
         edge_features = torch.cat([time_feat, aux_feat], dim=-1)
         edge_features = self.edge_norm(edge_features)
-        print(f"edge_features shape: {edge_features.shape}")
         
         # 通过GNN更新节点特征
         x = self.conv1(x, edge_index, edge_features)
         x = self.conv2(x, edge_index, edge_features)
-        print(f"After GNN x shape: {x.shape}")
         
         # 获取节点对特征
         start_nodes = x[edge_index[0]]  # [num_edges, hidden_dim]
@@ -370,7 +435,6 @@ class Spatio_Tmp_Embed(nn.Module):
         
         # 从辅助信息学习权重
         edge_weights = self.weight_net(aux_info)  # [num_edges, 1]
-        print(f"edge_weights shape: {edge_weights.shape}")
         
         # 融合特征
         node_pair_features = torch.cat([start_nodes, end_nodes], dim=-1)  # [num_edges, hidden_dim*2]
@@ -378,22 +442,20 @@ class Spatio_Tmp_Embed(nn.Module):
         
         # 全局池化
         fusion = gmp(weighted_features, batch[edge_index[0]])  # 使用源节点的batch信息
-        print(f"After pooling shape: {fusion.shape}")
         
         # 最终输出
         fusion = self.fuse_linear(self.norm(fusion))
-        print(f"Final output shape: {fusion.shape}")
 
-        # Self-supervised outputs
+        # Self-supervised outputs - generate all SSL outputs if enabled
         ssl_outputs = {}
-        if self.use_self_supervised:
-            # 对比学习表示
+        if self.ssl_mode != "none":
+            # Contrastive learning representation
             contrastive_repr = self.contrastive_head(x)
             ssl_outputs['contrastive'] = contrastive_repr
 
-            # 重建任务输出
-            reconstruction = self.reconstruction_head(x)
-            ssl_outputs['reconstruction'] = reconstruction
-            ssl_outputs['original'] = x  # 用于计算重建损失
+            # Link prediction task
+            edge_pred, edge_labels = self.link_prediction_head(x, edge_index, batch)
+            ssl_outputs['edge_pred'] = edge_pred
+            ssl_outputs['edge_labels'] = edge_labels
 
         return x, torch.sigmoid(fusion), ssl_outputs

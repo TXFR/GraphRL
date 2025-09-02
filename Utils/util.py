@@ -103,65 +103,208 @@ def contrastive_loss(embeddings, temperature=0.5):
 
     return loss
 
-def reconstruction_loss(reconstructed, original):
+def link_prediction_loss(edge_pred, edge_labels):
     """
-    MSE loss for trajectory reconstruction
-    """
-    return torch.nn.functional.mse_loss(reconstructed, original)
-
-def trajectory_masking_loss(x, masked_x, mask_ratio=0.15):
-    """
-    Masked prediction loss for trajectory sequences
-    """
-    # Randomly mask some trajectory points
-    batch_size, seq_len, feat_dim = x.shape
-    num_mask = int(seq_len * mask_ratio)
-
-    # Create random mask
-    mask_indices = torch.rand(batch_size, seq_len).argsort(dim=-1)[:, :num_mask]
-    mask = torch.zeros_like(x)
-    mask.scatter_(1, mask_indices.unsqueeze(-1).expand(-1, -1, feat_dim), 1)
-
-    # Apply mask
-    masked_x = x * (1 - mask) + mask * masked_x
-
-    # Predict masked positions
-    loss = torch.nn.functional.mse_loss(masked_x, x, reduction='none')
-    loss = loss.mean(dim=-1)  # Average over feature dimension
-    loss = (loss * mask.squeeze(-1)).sum() / mask.sum()  # Only masked positions
-
-    return loss
-
-def cal_self_supervised_loss(ssl_outputs, supervised_loss=None, alpha=0.1):
-    """
-    Combined self-supervised loss
+    Loss for link prediction task
 
     Args:
-        ssl_outputs: Dict containing contrastive, reconstruction outputs
+        edge_pred: Predicted probabilities for edge existence [num_samples, 1]
+        edge_labels: Ground truth edge labels (1 for existing, 0 for non-existing) [num_samples, 1]
+    """
+    if len(edge_pred) > 0 and len(edge_labels) > 0:
+        # Binary cross entropy loss for link prediction
+        loss = torch.nn.functional.binary_cross_entropy(edge_pred, edge_labels)
+        return loss
+    else:
+        return torch.tensor(0.0, device=edge_pred.device if len(edge_pred) > 0 else torch.device('cpu'))
+
+
+def augment_trajectory_graph(node_features, edge_index, edge_attr, augmentation_type="noise"):
+    """
+    Apply data augmentation to trajectory graph.
+
+    Args:
+        node_features: Node features [num_nodes, feature_dim]
+        edge_index: Edge indices [2, num_edges]
+        edge_attr: Edge attributes [num_edges, attr_dim]
+        augmentation_type: Type of augmentation ("noise", "dropout", "shuffle")
+
+    Returns:
+        augmented_node_features, augmented_edge_index, augmented_edge_attr
+    """
+    if augmentation_type == "noise":
+        # Add small noise to node features
+        noise = torch.randn_like(node_features) * 0.1
+        augmented_node_features = node_features + noise
+
+        # Keep edge structure same
+        augmented_edge_index = edge_index
+        augmented_edge_attr = edge_attr
+
+    elif augmentation_type == "dropout":
+        # Randomly dropout some nodes
+        keep_prob = 0.8
+        keep_mask = torch.rand(node_features.size(0)) < keep_prob
+        keep_indices = torch.where(keep_mask)[0]
+
+        if len(keep_indices) > 0:
+            augmented_node_features = node_features[keep_indices]
+
+            # Filter edges that connect kept nodes
+            edge_mask = torch.isin(edge_index[0], keep_indices) & torch.isin(edge_index[1], keep_indices)
+            augmented_edge_index = edge_index[:, edge_mask]
+            augmented_edge_attr = edge_attr[edge_mask]
+
+            # Remap edge indices
+            old_to_new = torch.full_like(keep_mask, -1, dtype=torch.long)
+            old_to_new[keep_indices] = torch.arange(len(keep_indices), device=edge_index.device)
+            augmented_edge_index = old_to_new[augmented_edge_index]
+        else:
+            # Keep at least one node
+            augmented_node_features = node_features[:1]
+            augmented_edge_index = torch.empty(2, 0, dtype=torch.long, device=edge_index.device)
+            augmented_edge_attr = torch.empty(0, edge_attr.size(-1), device=edge_attr.device)
+
+    elif augmentation_type == "shuffle":
+        # Shuffle node order
+        perm = torch.randperm(node_features.size(0))
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(len(perm), device=perm.device)
+
+        augmented_node_features = node_features[perm]
+        augmented_edge_index = inv_perm[edge_index]
+        augmented_edge_attr = edge_attr
+
+    else:
+        # No augmentation
+        augmented_node_features = node_features
+        augmented_edge_index = edge_index
+        augmented_edge_attr = edge_attr
+
+    return augmented_node_features, augmented_edge_index, augmented_edge_attr
+
+def trajectory_contrastive_loss(node_embeddings, batch_indices, temperature=0.07):
+    """
+    Pure self-supervised contrastive loss for trajectory graphs.
+
+    Uses a label-free approach where we simply encourage:
+    - Similar embeddings to be close (positive pairs)
+    - Dissimilar embeddings to be far apart (negative pairs)
+
+    Since we don't have explicit positive/negative pairs, we use:
+    - Positive pairs: Different random augmentations of the same graph embedding
+    - Negative pairs: All other graph embeddings
+
+    Args:
+        node_embeddings: Node-level embeddings [num_nodes, embed_dim]
+        batch_indices: Node-level batch indices [num_nodes]
+        temperature: Temperature parameter (not used in this simplified version)
+    """
+    from torch_scatter import scatter_mean
+
+    # Aggregate node embeddings to graph-level representations
+    graph_embeddings = scatter_mean(node_embeddings, batch_indices, dim=0)  # [num_graphs, embed_dim]
+
+    num_graphs = graph_embeddings.size(0)
+
+    if num_graphs < 2:
+        return torch.tensor(0.0, device=graph_embeddings.device)
+
+    # Create two augmented views of each graph embedding
+    # This simulates having two different augmentations of the same input
+    noise1 = torch.randn_like(graph_embeddings) * 0.1
+    noise2 = torch.randn_like(graph_embeddings) * 0.1
+
+    view1 = graph_embeddings + noise1  # [num_graphs, embed_dim]
+    view2 = graph_embeddings + noise2  # [num_graphs, embed_dim]
+
+    # Normalize both views
+    view1 = torch.nn.functional.normalize(view1, dim=-1)
+    view2 = torch.nn.functional.normalize(view2, dim=-1)
+
+    # Compute similarities between corresponding views (positive pairs)
+    pos_similarities = torch.sum(view1 * view2, dim=-1)  # [num_graphs]
+
+    # Compute similarities between different graphs (negative pairs)
+    # For each graph, compute similarity with all other graphs
+    neg_similarities = []
+    for i in range(num_graphs):
+        # Similarities between view1 of graph i and view1 of all other graphs
+        neg_sim_i = torch.matmul(view1[i:i+1], view1.t())[0]  # [num_graphs]
+        neg_sim_i = neg_sim_i[torch.arange(num_graphs) != i]  # Remove self-similarity
+        neg_similarities.append(neg_sim_i)
+
+    neg_similarities = torch.stack(neg_similarities)  # [num_graphs, num_graphs-1]
+
+    # Compute contrastive loss for each graph
+    loss = 0
+    for i in range(num_graphs):
+        pos_sim = pos_similarities[i]  # scalar
+        neg_sims = neg_similarities[i]  # [num_graphs-1]
+
+        # InfoNCE-style loss: -log(exp(pos_sim) / (exp(pos_sim) + sum(exp(neg_sims))))
+        numerator = torch.exp(pos_sim)
+        denominator = numerator + torch.sum(torch.exp(neg_sims))
+        loss_i = -torch.log(numerator / denominator)
+        loss += loss_i
+
+    # Average loss over all graphs
+    loss = loss / num_graphs
+    return loss
+
+
+
+def cal_self_supervised_loss(ssl_outputs, supervised_loss=None, ssl_mode="combined",
+                           ssl_weight=1.0, supervised_weight=0.1, batch_indices=None):
+    """
+    Enhanced self-supervised loss function
+
+    Args:
+        ssl_outputs: Dict containing SSL task outputs
         supervised_loss: Optional supervised loss for multi-task learning
-        alpha: Weight for supervised loss when doing multi-task
+        ssl_mode: SSL mode ("contrastive", "reconstruction", "combined")
+        ssl_weight: Weight for SSL losses
+        supervised_weight: Weight for supervised loss in multi-task
+        batch_indices: Batch indices for proper contrastive learning
+
+    Returns:
+        total_loss: Combined total loss
+        loss_components: Dict containing individual loss components
     """
     total_loss = 0
+    loss_components = {}
 
-    # Contrastive loss
-    if 'contrastive' in ssl_outputs:
-        contrastive_embeddings = ssl_outputs['contrastive']
-        cont_loss = contrastive_loss(contrastive_embeddings)
-        total_loss += cont_loss
+    # Always compute available SSL losses when SSL is enabled
+    if ssl_mode != "none":
+        # Contrastive loss (trajectory-level) - always compute if available
+        if 'contrastive' in ssl_outputs:
+            if batch_indices is not None:
+                cont_loss = trajectory_contrastive_loss(
+                    ssl_outputs['contrastive'],  # Node embeddings
+                    batch_indices
+                )
+            else:
+                # Fallback to original contrastive loss if no batch_indices
+                cont_loss = contrastive_loss(ssl_outputs['contrastive'])
+            total_loss += ssl_weight * cont_loss
+            loss_components['contrastive_loss'] = cont_loss.item()
 
-    # Reconstruction loss
-    if 'reconstruction' in ssl_outputs and 'original' in ssl_outputs:
-        recon_loss = reconstruction_loss(
-            ssl_outputs['reconstruction'],
-            ssl_outputs['original']
-        )
-        total_loss += recon_loss
+        # Link prediction loss - always compute if available
+        if 'edge_pred' in ssl_outputs:
+            link_loss = link_prediction_loss(
+                ssl_outputs['edge_pred'],
+                ssl_outputs['edge_labels']
+            )
+            total_loss += ssl_weight * link_loss
+            loss_components['link_prediction_loss'] = link_loss.item()
 
     # Multi-task: combine with supervised loss
     if supervised_loss is not None:
-        total_loss = total_loss + alpha * supervised_loss
+        supervised_component = supervised_weight * supervised_loss
+        total_loss = total_loss + supervised_component
+        loss_components['supervised_component'] = supervised_component.item()
 
-    return total_loss
+    return total_loss, loss_components
 
 def evaluate(logits, labels):
     # 确保输入在同一设备上

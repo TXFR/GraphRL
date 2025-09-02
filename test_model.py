@@ -24,7 +24,8 @@ def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, 
     all_edge_attrs = []
     all_labels = []
     all_pos = []
-    
+    all_batch = []
+
     total_nodes = 0
     
     for graph_idx in range(batch_size):
@@ -73,6 +74,10 @@ def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, 
         all_labels.append(label)
         
         # 5. 创建position信息
+        # 创建batch索引：标识每个节点属于哪个图
+        batch_idx = torch.full((num_nodes,), graph_idx, dtype=torch.long, device=device)
+        all_batch.append(batch_idx)
+
         pos = torch.full((num_edges,), graph_idx, dtype=torch.long, device=device)
         all_pos.append(pos)
         
@@ -85,28 +90,26 @@ def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, 
         edge_attr=torch.cat(all_edge_attrs),
         y=torch.stack(all_labels),
         pos=torch.cat(all_pos),
-        batch=torch.repeat_interleave(
-            torch.arange(batch_size, device=device),
-            repeats=torch.tensor([num_nodes] * batch_size, device=device)
-        )
+        batch=torch.cat(all_batch)  # 正确的batch索引
     )
     
     return batch_data
 
-def test_model():
+def test_model(ssl_mode="none"):
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+    print(f"Testing SSL mode: {ssl_mode}")
+
     # 创建配置
     config = ModelConfig()
-    
+    config.ssl_mode = ssl_mode
+
     # 创建模型
-    model = Build_Model(config).to(device)
-    print("Model created successfully")
-    
+    use_ssl = ssl_mode != "none"
+    model = Build_Model(config, use_self_supervised=use_ssl).to(device)
+
     # 创建一个批次的数据
-    print("\nCreating batch data...")
     batch = create_batch_data(
         batch_size=5,
         num_nodes=4,
@@ -114,79 +117,142 @@ def test_model():
         location_dim=8,
         device=device
     )
-    
-    print("\nBatch information:")
-    print(f"- Number of graphs: {batch.num_graphs}")
-    print(f"- Total nodes: {batch.num_nodes}")
-    print(f"- Total edges: {batch.edge_index.size(1)}")
-    
-    print("\nInput shapes:")
-    print(f"- Node features: {batch.x.shape}")
-    print(f"- Edge index: {batch.edge_index.shape}")
-    print(f"- Edge attr: {batch.edge_attr.shape}")
-    print(f"- Labels: {batch.y.shape}")
-    print(f"- Batch: {batch.batch.shape}")
-    print(f"- Position: {batch.pos.shape}")
-    
+
     # 设置模型为训练模式
     model.train()
-    
+
     # 创建优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
+
     try:
-        # 前向传播
-        print("\nAttempting forward pass...")
         
         # 分离边属性中的时间特征和辅助信息
         edge_time_attr = batch.edge_attr[:, :48]  # 前48维是时间特征
         edge_aux_info = batch.edge_attr[:, -2:]   # 最后2维是频率和距离
         
-        t_cls, l_cls, t_l_cls = model(
+        # Forward pass - handle different SSL modes
+        # Prepare original edge attributes for reconstruction task
+        original_edge_attr = (edge_time_attr, edge_aux_info)
+
+        model_outputs = model(
             batch.x,
             batch.edge_index,
             (edge_time_attr, edge_aux_info, batch.pos),  # 正确的边属性格式
-            batch.batch
+            batch.batch,
+            original_edge_attr
         )
-        
+
+        # Handle different return values based on SSL mode
+        if ssl_mode != "none":
+            t_cls, l_cls, t_l_cls, ssl_outputs = model_outputs
+        else:
+            t_cls, l_cls, t_l_cls = model_outputs
+            ssl_outputs = None
+
         # 计算损失
         device = t_l_cls.device
         batch_y = batch.y.to(device)
-        
+
         try:
             # 使用与训练相同的损失函数
             loss_pred = cal_traj_loss(t_l_cls, batch_y)
             loss_l = cal_location_loss(l_cls, batch_y.to(torch.float))
             loss_t = cal_time_loss(t_cls, batch_y.to(torch.float))
-            
+
             # 计算评估指标
             accuracy, precision, recall, f1 = evaluate(t_l_cls, batch.y)
-            
+
             # 总损失
-            loss = loss_t + loss_l + loss_pred
-            
+            supervised_loss = loss_t + loss_l + loss_pred
+
+            if ssl_mode != "none":
+                from Utils.util import cal_self_supervised_loss
+                ssl_loss, loss_components = cal_self_supervised_loss(
+                    ssl_outputs,
+                    supervised_loss if ssl_mode == "combined" else None,
+                    ssl_mode=ssl_mode,
+                    batch_indices=batch.batch
+                )
+                total_loss = ssl_loss
+
+                # Print individual SSL loss components
+                if 'contrastive_loss' in loss_components:
+                    print(f"Contrastive Loss: {loss_components['contrastive_loss']:.4f}")
+                if 'link_prediction_loss' in loss_components:
+                    print(f"Link Prediction Loss: {loss_components['link_prediction_loss']:.4f}")
+                print(f"SSL Total Loss: {ssl_loss.item():.4f}")
+            else:
+                total_loss = supervised_loss
+
             # 反向传播
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
-            
-            print("\nTraining metrics:")
-            print(f"Total Loss: {loss.item():.4f}")
-            print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}")
-            print(f"Recall: {recall:.4f}, F1: {f1:.4f}")
-            
+
+            print(f"Total Loss: {total_loss.item():.4f}")
+            print(f"Supervised Loss: {supervised_loss.item():.4f}")
+            print(f"Accuracy: {accuracy:.4f}")
+
             return True
-            
+
         except Exception as e:
-            print(f"\nError: {str(e)}")
+            print(f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
-        
+
     except Exception as e:
-        print(f"\nError occurred: {str(e)}")
+        print(f"Error occurred: {str(e)}")
         return False
 
+def test_all_modes():
+    """Test all SSL modes to ensure backward compatibility"""
+    modes_to_test = ["none", "contrastive", "reconstruction", "combined"]
+
+    print("Testing all SSL modes for backward compatibility...")
+
+    for mode in modes_to_test:
+        print(f"\n--- Testing {mode} mode ---")
+        success = test_model(ssl_mode=mode)
+        if not success:
+            print(f"✗ {mode} mode test failed!")
+            return False
+
+    return True
+
+
 if __name__ == "__main__":
-    success = test_model()
-    if success:
-        print("\nModel test completed successfully!")
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Test TrajGNN model')
+    parser.add_argument('--ssl', action='store_true',
+                       help='Enable self-supervised learning (contrastive + link prediction)')
+    parser.add_argument('--ssl-mode', type=str, choices=['none', 'contrastive', 'reconstruction', 'combined'],
+                       default='none', help='Self-supervised learning mode to test (legacy)')
+    parser.add_argument('--all-modes', action='store_true',
+                       help='Test all SSL modes for backward compatibility')
+    parser.add_argument('--explain', action='store_true',
+                       help='Show detailed explanation of SSL outputs')
+
+    args = parser.parse_args()
+
+    # Determine SSL mode
+    if args.ssl:
+        ssl_mode = "combined"  # Enable both contrastive and link prediction
     else:
-        print("\nModel test failed!")
+        ssl_mode = args.ssl_mode
+
+    if args.all_modes:
+        success = test_all_modes()
+        if success:
+            print("\n🎉 All SSL modes tested successfully! Backward compatibility maintained.")
+        else:
+            print("\n❌ Some SSL mode tests failed!")
+    else:
+        success = test_model(ssl_mode=ssl_mode)
+        if success:
+            if ssl_mode == "none":
+                print("\n✓ Supervised learning test completed successfully!")            
+            else:
+                print(f"\n✓ SSL ({ssl_mode}) test completed successfully!")
+        else:
+            print(f"\n✗ {ssl_mode} mode test failed!")

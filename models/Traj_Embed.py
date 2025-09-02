@@ -22,20 +22,22 @@ class Build_Model(nn.Module):
     - Final output shape: (batch_size, 24, 8) - probability for each hour and location type
     """
     
-    def __init__(self, config):
+    def __init__(self, config, use_self_supervised: bool = False):
         """
         Initialize the model with configuration parameters.
-        
+
         Args:
             config: ModelConfig object containing all model parameters
+            use_self_supervised: Whether to use self-supervised learning
         """
         super(Build_Model, self).__init__()
-        
+
         # Store dimensions for later use
         self.time_slots = config.time_slots
         self.hours_per_day = config.hours_per_day
         self.location_categories = config.location_categories
         self.decoder_dim = config.decoder_dim
+        self.ssl_mode = config.ssl_mode  # Use config.ssl_mode directly, it's already set appropriately
         
         # Initialize embedding modules
         self.time_embed = Temporal_Embed(
@@ -57,7 +59,8 @@ class Build_Model(nn.Module):
             config.out_features_l,
             config.hidden_features,
             config.st_fuse_num,
-            config.t_l_embed
+            config.t_l_embed,
+            ssl_mode=self.ssl_mode
         )
         
         # Additional components
@@ -129,32 +132,48 @@ class Build_Model(nn.Module):
         
         return output
 
-    def forward(self, x, edge_index, edge_attr, batch):
-        """Forward pass through the model."""        
+    def forward(self, x, edge_index, edge_attr, batch, original_edge_attr=None):
+        """Forward pass through the model."""
         # Unpack edge attributes
         edge_attr, aux_info, pos = edge_attr
         print(f"Edge attr shape: {edge_attr.shape}")
         print(f"Aux info shape: {aux_info.shape}")
         print(f"Position shape: {pos.shape}")
-        
+
+        # Store original edge attributes for reconstruction task
+        if original_edge_attr is None:
+            original_time_attr = edge_attr  # Assume this is the original if not provided
+            original_aux_info = aux_info
+        else:
+            original_time_attr, original_aux_info = original_edge_attr
+
         # Time embedding
         x_t, t_cls = self.time_embed(edge_attr, aux_info, pos)
         # Location embedding
         x_transformed = self.location_linear(x)
         x_l, l_cls = self.location_embed(x_transformed, edge_index, aux_info, batch)
 
-        x_t_l, t_l_cls = self.spatio_tmp_embed(
+        x_t_l, t_l_cls, ssl_outputs = self.spatio_tmp_embed(
             x=x_l,
             edge_index=edge_index,
             edge_attr=(x_t, aux_info, pos),
             batch=batch
         )
-        
+
+        # Update SSL outputs with original edge attributes for reconstruction
+        if self.ssl_mode != "none" and 'reconstruction_time' in ssl_outputs:
+            ssl_outputs['original_time'] = original_time_attr
+            ssl_outputs['original_aux'] = original_aux_info
+
         # Transfer and return
         t_l_cls = self.spatio_temp_transfer(t_cls, l_cls, t_l_cls)
         print("\nFinal output shapes:")
         print(f"t_cls shape: {t_cls.shape}")
         print(f"l_cls shape: {l_cls.shape}")
         print(f"t_l_cls shape: {t_l_cls.shape}")
-        
-        return t_cls, l_cls, t_l_cls
+
+        # Return different outputs based on SSL mode
+        if self.ssl_mode == "none":
+            return t_cls, l_cls, t_l_cls
+        else:
+            return t_cls, l_cls, t_l_cls, ssl_outputs

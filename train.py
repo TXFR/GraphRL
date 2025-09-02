@@ -14,9 +14,10 @@ from Utils.logger import TrainingLogger
 from config.model_config import ModelConfig
 
 class TrainingPipeline:
-    def __init__(self, config: ModelConfig, use_self_supervised: bool = True):
+    def __init__(self, config: ModelConfig, use_self_supervised: bool = False):
         self.config = config
         self.use_self_supervised = use_self_supervised
+        self.ssl_mode = config.ssl_mode  # Use config.ssl_mode directly, it's already set appropriately
         self.logger = TrainingLogger()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -62,30 +63,32 @@ class TrainingPipeline:
     def process_batch(self, data):
         """
         Process a single batch of data
-        
+
         Edge attributes structure:
         - first_traj_edge_attr: 时间转移向量 [batch_size, time_slots]
         - freqs: 频率 [batch_size, 1]
         - edge_distances: 距离 [batch_size, 1]
         """
         x, edge_index, edge_attr, y, pos, batch, ptr = data.to(self.device)
-        
+
         # Process edge attributes
-        edge_attr = edge_attr[1].to(torch.float32)
-        time_attr = edge_attr[:, :self.config.edge_time_dim]  # 时间转移向量
-        freq = edge_attr[:, -2].unsqueeze(-1)  # 频率
-        distance = edge_attr[:, -1].unsqueeze(-1)  # 距离
-        
+        edge_attr_processed = edge_attr[1].to(torch.float32)
+        time_attr = edge_attr_processed[:, :self.config.edge_time_dim]  # 时间转移向量
+        freq = edge_attr_processed[:, -2].unsqueeze(-1)  # 频率
+        distance = edge_attr_processed[:, -1].unsqueeze(-1)  # 距离
+
         # 组合辅助特征
         aux_attr = torch.cat([freq, distance], dim=-1)
-        
+
         x_ = x[1].to(torch.float32)
         pos_batch = self.edge_batch(pos[1])
-        
-        # 返回处理后的边属性
+
+        # 返回处理后的边属性和原始边属性
         edge_attr = (time_attr, aux_attr, pos_batch)
-        
-        return x_, edge_index[1], edge_attr, batch[1], y[1]
+        # Store original edge attributes for reconstruction task
+        original_edge_attr = (edge_attr_processed[:, :self.config.edge_time_dim], aux_attr)
+
+        return x_, edge_index[1], edge_attr, batch[1], y[1], original_edge_attr
         
     @staticmethod
     def edge_batch(pos):
@@ -103,13 +106,13 @@ class TrainingPipeline:
             self.optimizer.zero_grad()
             
             # Process batch
-            x_, edge_index, edge_attr, batch, y = self.process_batch(data)
-            
-            # Forward pass
-            model_outputs = self.model(x_, edge_index, edge_attr, batch)
+            x_, edge_index, edge_attr, batch, y, original_edge_attr = self.process_batch(data)
 
-            # Handle different return values based on self-supervised setting
-            if self.use_self_supervised:
+            # Forward pass
+            model_outputs = self.model(x_, edge_index, edge_attr, batch, original_edge_attr)
+
+            # Handle different return values based on SSL mode
+            if self.ssl_mode != "none":
                 time_l, location_l, t_l_cls, ssl_outputs = model_outputs
             else:
                 time_l, location_l, t_l_cls = model_outputs
@@ -119,20 +122,26 @@ class TrainingPipeline:
             loss_pred = cal_traj_loss(t_l_cls, y)
             loss_l = cal_location_loss(location_l, y.to(torch.float))
             loss_t = cal_time_loss(time_l, y.to(torch.float))
+            supervised_loss = loss_t + loss_l + loss_pred
 
             # Calculate self-supervised loss if enabled
-            supervised_loss = loss_t + loss_l + loss_pred
-            if self.use_self_supervised:
-                ssl_loss = cal_self_supervised_loss(ssl_outputs, supervised_loss, alpha=0.1)
-                total_loss = ssl_loss
+            if self.ssl_mode != "none":
+                ssl_loss, loss_components = cal_self_supervised_loss(
+                    ssl_outputs,
+                    supervised_loss if self.ssl_mode == "combined" else None,
+                    ssl_mode=self.ssl_mode,
+                    ssl_weight=self.config.ssl_weight,
+                    supervised_weight=self.config.supervised_weight,
+                    batch_indices=batch
+                )
+                # Use SSL loss for backward pass
+                loss = ssl_loss
             else:
-                total_loss = supervised_loss
+                loss = supervised_loss
 
             # Evaluate metrics
             accuracy, precision, recall, f1 = evaluate(t_l_cls, y)
 
-            # Use supervised loss for backward pass when evaluating
-            loss = supervised_loss
             loss.backward()
             self.optimizer.step()
             
@@ -180,9 +189,17 @@ class TrainingPipeline:
             
         self.logger.log_info("Training completed!")
 
-def main(use_self_supervised=True):
+def main(use_self_supervised=False, ssl_mode="none"):
     # Initialize config
     config = ModelConfig()
+
+    # Set SSL mode based on parameters
+    if use_self_supervised and ssl_mode != "none":
+        config.ssl_mode = ssl_mode
+    elif use_self_supervised:
+        config.ssl_mode = "combined"  # Default to combined mode if SSL enabled but no specific mode
+    else:
+        config.ssl_mode = "none"
 
     # Create and run training pipeline
     pipeline = TrainingPipeline(config, use_self_supervised=use_self_supervised)
@@ -193,15 +210,40 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Train TrajGNN model')
     parser.add_argument('--supervised', action='store_true',
-                       help='Use supervised learning only (default: self-supervised)')
-    parser.add_argument('--self-supervised', action='store_true', default=True,
-                       help='Use self-supervised learning (default: True)')
+                       help='Use supervised learning only (no self-supervised)')
+    parser.add_argument('--ssl', action='store_true',
+                       help='Enable self-supervised learning (contrastive + link prediction)')
+    parser.add_argument('--ssl-mode', type=str, choices=['none', 'contrastive', 'reconstruction', 'combined'],
+                       default='combined', help='Self-supervised learning mode (legacy)')
+    parser.add_argument('--ssl-weight', type=float, default=1.0,
+                       help='Weight for self-supervised losses')
+    parser.add_argument('--supervised-weight', type=float, default=0.1,
+                       help='Weight for supervised loss in multi-task learning')
 
     args = parser.parse_args()
 
-    # If --supervised is specified, disable self-supervised
-    use_ssl = not args.supervised
+    # Initialize config first
+    config = ModelConfig()
 
-    main(use_self_supervised=use_ssl)
+    # Determine SSL usage and mode
+    if args.ssl:
+        # New simplified SSL interface
+        use_ssl = True
+        ssl_mode = "combined"
+    elif args.supervised:
+        # Explicit supervised only
+        use_ssl = False
+        ssl_mode = "none"
+    else:
+        # Legacy mode: use ssl-mode parameter
+        use_ssl = args.ssl_mode != "none"
+        ssl_mode = args.ssl_mode
+
+    # Update config with command line arguments
+    config.ssl_mode = ssl_mode
+    config.ssl_weight = args.ssl_weight
+    config.supervised_weight = args.supervised_weight
+
+    main(use_self_supervised=use_ssl, ssl_mode=ssl_mode)
 
 

@@ -20,32 +20,25 @@ wheels/
 .installed.cfg
 *.egg
 
+# Virtual Environment
+venv/
+env/
+ENV/
+
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Environment
-.env
-.venv
-env/
-venv/
-ENV/
-
 # Data
 data/
 *.pkl
-*.h5
-*.npy
-*.npz
-
-# Logs
-logs/
-*.log
-
-# Model checkpoints
-checkpoints/
 *.pth
-*.pkl
-*.ckpt
+*.pt
+checkpoints/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
