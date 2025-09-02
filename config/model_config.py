@@ -9,24 +9,23 @@ class ModelConfig:
     
     # Location-related parameters
     location_categories: int = 8  # 位置类别数
+    location_ini_embeds: int = 128  # 初始节点嵌入维度
     
     # Feature dimensions
-    out_features_t: int = 64  # 时间特征输出维度
-    hidden_features: int = 128  # 隐藏层维度
-    out_features_l: int = 128  # 位置特征输出维度
-    st_fuse_num: int = 128 * 3  # 时空融合维度
+    out_features_t: int = 64  # 时间特征输出维度（边特征）
+    hidden_channels: int = 128  # GNN隐藏层维度
+    out_features_l: int = 128  # 空间特征输出维度（节点特征）
+    gnn_num_layers: int = 4  # 深层GNN的层数（可调）
     
     # Edge attribute dimensions
     edge_time_dim: int = 48  # 边的时间转移向量维度（一天的时间槽数）
-    edge_attr_dim: int = 64  # GNN中边特征的维度
     
     # Derived parameters (will be set in __post_init__)
     time_in: int = None  # 时间特征输入维度（基于time_slots）
     location_in: int = None  # 位置特征输入维度
     loc_cls_num: int = None  # 位置分类数
     t_cls: int = None  # 时间分类数（基于hours_per_day）
-    t_l_embed: int = None  # 时空嵌入维度
-    decoder_dim: int = None  # 解码器维度（hours_per_day * location_categories）
+    decoder_dim: int = None  # 时空联合分类维度（hours_per_day * location_categories）
 
     # Training Parameters
     batch_size: int = 256
@@ -66,11 +65,10 @@ class ModelConfig:
         """Initialize derived parameters and validate configuration"""
         # Set derived parameters based on actual meanings
         self.time_in = self.time_slots  # 输入是30分钟一个槽的时间特征
-        self.location_in = self.location_categories  # 位置特征维度
+        self.location_in = self.location_ini_embeds  # 位置特征维度
         self.loc_cls_num = self.location_categories  # 位置分类数
         self.t_cls = self.hours_per_day  # 输出预测24小时的时间分布
-        self.t_l_embed = self.hours_per_day  # 时空嵌入维度与小时数对应
-        self.decoder_dim = self.hours_per_day * self.location_categories  # 24小时 * 8种地点类别
+        self.decoder_dim = self.hours_per_day * self.location_categories  # 时空联合分类维度
         
         # Validate time-related parameters
         assert self.time_slots > 0, "time_slots must be positive"
@@ -87,7 +85,8 @@ class ModelConfig:
         
         # Validate feature dimensions
         assert self.decoder_dim > 0, "decoder_dim must be positive"
-        assert self.st_fuse_num > 0, "st_fuse_num must be positive"
+        assert self.hidden_channels > 0, "hidden_channels must be positive"
+        assert self.gnn_num_layers > 0, "gnn_num_layers must be positive"
         
         # Additional semantic validations
         assert self.time_slots % 2 == 0, "time_slots should be even (for 30-min intervals)"

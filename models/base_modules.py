@@ -324,138 +324,286 @@ class LinkPrediction(nn.Module):
             # Fallback: return only positive predictions
             return pos_edge_pred, torch.ones_like(pos_edge_pred, device=device)
 
+class DenseGNN(nn.Module):
+    """
+    Dense Graph Neural Network with enhanced residual connections.
+    
+    Features:
+    1. Dense connections for feature reuse
+    2. Pre-norm design for stable training
+    3. Dual residual paths (skip + transform) to prevent over-smoothing
+    4. Elastic aggregation to preserve local structure
+    5. Gated residual learning
+    """
+    def __init__(self, in_channels: int, hidden_channels: int, 
+                 edge_dim: int, num_layers: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # Input projection
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
+        
+        # Layer components
+        self.convs = nn.ModuleList()
+        self.norms1 = nn.ModuleList()  # Pre-norm for GNN
+        self.norms2 = nn.ModuleList()  # Pre-norm for FFN
+        self.ffns = nn.ModuleList()    # Feed-forward networks
+        self.skips = nn.ModuleList()   # Skip connections
+        self.gates = nn.ModuleList()   # Residual gates
+        
+        # First layer
+        self.convs.append(self._build_conv(hidden_channels, hidden_channels, edge_dim))
+        self.norms1.append(nn.LayerNorm(hidden_channels))
+        self.norms2.append(nn.LayerNorm(hidden_channels))
+        self.ffns.append(self._build_ffn(hidden_channels))
+        self.skips.append(nn.Identity())
+        self.gates.append(self._build_gate(hidden_channels))
+        
+        # Subsequent layers
+        for i in range(1, num_layers):
+            layer_in_channels = hidden_channels * (i + 1)  # Dense connection
+            self.convs.append(self._build_conv(layer_in_channels, hidden_channels, edge_dim))
+            self.norms1.append(nn.LayerNorm(layer_in_channels))
+            self.norms2.append(nn.LayerNorm(hidden_channels))
+            self.ffns.append(self._build_ffn(hidden_channels))
+            self.skips.append(nn.Linear(layer_in_channels, hidden_channels))
+            self.gates.append(self._build_gate(hidden_channels))
+    
+    def _build_ffn(self, hidden_channels: int) -> nn.Sequential:
+        """Builds a position-wise feed-forward network."""
+        return nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels * 4),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(hidden_channels * 4, hidden_channels),
+            nn.Dropout(self.dropout)
+        )
+    
+    def _build_gate(self, hidden_channels: int) -> nn.Sequential:
+        """Builds a gating mechanism for residual learning."""
+        return nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.Sigmoid()
+        )
+    
+    @staticmethod
+    def _build_conv(in_channels: int, out_channels: int, edge_dim: int) -> GENConv:
+        """Builds a GENConv layer with specified configuration."""
+        return GENConv(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            edge_dim=edge_dim,
+            aggr="softmax",  # Use softmax aggregation for local sensitivity
+            learn_p=True,
+            msg_norm=True,
+            learn_msg_scale=True,
+            norm="layer"
+        )
+    
+    def forward(self, x, edge_index, edge_attr):
+        """
+        Forward pass through the dense GNN.
+        
+        Args:
+            x: Node features [num_nodes, in_channels]
+            edge_index: Edge indices [2, num_edges]
+            edge_attr: Edge features [num_edges, edge_dim]
+            
+        Returns:
+            Final node representations [num_nodes, hidden_channels]
+        """
+        # Initial projection
+        x = self.input_proj(x)
+        xs = [x]  # Store all layer outputs for dense connections
+        
+        for i in range(self.num_layers):
+            # Prepare input with dense connections
+            current_input = x if i == 0 else torch.cat(xs, dim=-1)
+            
+            # 1. GNN sublayer with residual
+            residual = x
+            current_input = self.norms1[i](current_input)
+            conv_out = self.convs[i](current_input, edge_index, edge_attr)
+            skip_out = self.skips[i](current_input)
+            
+            # Gated residual connection for GNN
+            gate_input = torch.cat([conv_out, residual], dim=-1)
+            gate = self.gates[i](gate_input)
+            x = gate * conv_out + (1 - gate) * skip_out
+            
+            # 2. FFN sublayer with residual
+            residual = x
+            x = self.norms2[i](x)
+            x = self.ffns[i](x) + residual
+            
+            # Store output for dense connections
+            xs.append(x)
+        
+        return xs[-1]  # Return final layer output
+
 class Spatio_Tmp_Embed(nn.Module):
     """
     Spatio-temporal embedding module with self-supervised capabilities.
-
-    融合空间和时间特征的图神经网络模块。处理流程：
-    1. 将时间特征和辅助信息（频率、距离）编码为边特征
-    2. 通过GNN层更新节点的时空特征
-    3. 使用注意力机制融合节点对的特征
-    4. 支持对比学习和重建任务
-
-    Input:
-        - x: 已经过LocationEmbed更新的节点特征
-        - edge_index: 图的连接关系
-        - edge_attr: (time_attr, aux_info) 包含：
-            * time_attr: 经过Temporal_Embed更新的时间特征 [batch_size, time_slots]
-            * aux_info: 辅助信息 (freq, distance) [batch_size, 2]
-        - batch: 批处理索引
+    
+    Architecture:
+    1. Edge Feature Encoder: Combines temporal and auxiliary information
+    2. Deep Dense GNN: Processes node features with dense connections
+    3. Node Pair Fusion: Combines node pairs and their edge features
+    4. Self-supervised Learning: Optional SSL tasks (contrastive, link prediction)
+    
+    Args:
+        embed_dim: Node feature dimension (128)
+        hidden_channels: Hidden layer dimension (128)
+        decoder_dim: Joint classification dimension (192)
+        out_features_t: Temporal feature dimension (64)
+        ssl_mode: Self-supervised learning mode
     """
     def __init__(self, embed_dim: int, hidden_channels: int,
-                 fuse_num: int, t_l_embed: int, edge_attr_dim: int = 64,
-                 ssl_mode: str = "none"):
-        super(Spatio_Tmp_Embed, self).__init__()
-
-        self.edge_attr_dim = edge_attr_dim
+                 decoder_dim: int, out_features_t: int = 64, ssl_mode: str = "none", gnn_num_layers: int = 4):
+        super().__init__()
         self.ssl_mode = ssl_mode
         self.use_ssl = ssl_mode != "none"
         
-        # 边特征编码层
-        self.time_proj = nn.Linear(64, edge_attr_dim // 2)  # 从time_embed输出的64维特征
-        self.aux_proj = nn.Linear(2, edge_attr_dim // 2)    # 辅助信息投影
-        self.edge_norm = nn.LayerNorm(edge_attr_dim)
+        # Edge Feature Encoder
+        self.edge_encoder = nn.ModuleDict({
+            'time_proj': nn.Linear(out_features_t, out_features_t // 2),
+            'aux_proj': nn.Linear(2, out_features_t // 2),
+            'norm': nn.LayerNorm(out_features_t)
+        })
         
-        # GEN convolution layers for feature fusion
-        self.conv1 = GENConv(
-            in_channels=embed_dim, 
-            out_channels=hidden_channels,
-            edge_dim=edge_attr_dim,
-            aggr="powermean",
-            learn_p=True,
-            msg_norm=True,
-            learn_msg_scale=True,
-            norm="layer"
+        # Deep Dense GNN
+        self.gnn = DenseGNN(
+            in_channels=embed_dim,
+            hidden_channels=hidden_channels,
+            edge_dim=out_features_t,
+            num_layers=gnn_num_layers
         )
         
-        self.conv2 = GENConv(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            edge_dim=edge_attr_dim,
-            aggr="powermean",
-            learn_p=True,
-            msg_norm=True,
-            learn_msg_scale=True,
-            norm="layer"
-        )
+        # Node Pair Feature Fusion
+        self.fusion = nn.ModuleDict({
+            'weight_net': nn.Sequential(
+                nn.Linear(2, hidden_channels),
+                nn.LayerNorm(hidden_channels),
+                nn.ReLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+                nn.LayerNorm(hidden_channels),
+                nn.ReLU(),
+                nn.Linear(hidden_channels, 1),
+                nn.Sigmoid()
+            ),
+            'norm': nn.LayerNorm(hidden_channels * 2 + out_features_t),
+            'proj': nn.Linear(hidden_channels * 2 + out_features_t, decoder_dim)
+        })
         
-        # 从辅助信息学习权重的网络
-        self.weight_net = nn.Sequential(
-            nn.Linear(2, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(),
-            nn.Linear(hidden_channels, 1),
-            nn.Sigmoid()  # 确保权重在0-1之间
-        )
-        
-        # 输出层
-        self.norm = nn.LayerNorm(hidden_channels * 2)  # 两个节点的特征拼接
-        self.fuse_linear = nn.Linear(hidden_channels * 2, t_l_embed)
+        # Self-supervised Learning Heads
+        if self.use_ssl:
+            self.ssl_heads = nn.ModuleDict({
+                'contrastive': ContrastiveHead(
+                    embed_dim=hidden_channels,
+                    hidden_dim=hidden_channels,
+                    output_dim=128
+                ),
+                'link_pred': LinkPrediction(
+                    node_dim=embed_dim,
+                    hidden_dim=hidden_channels
+                )
+            })
 
-                    # Self-supervised learning modules - initialize all if SSL is enabled
-        if self.ssl_mode != "none":
-            self.contrastive_head = ContrastiveHead(
-                embed_dim=hidden_channels,
-                hidden_dim=hidden_channels,
-                output_dim=128
+    def _encode_edge_features(self, time_attr, aux_info):
+        """Encode temporal and auxiliary edge information."""
+        time_feat = self.edge_encoder['time_proj'](time_attr)
+        aux_feat = self.edge_encoder['aux_proj'](aux_info)
+        edge_features = torch.cat([time_feat, aux_feat], dim=-1)
+        return self.edge_encoder['norm'](edge_features)
+    
+    def _fuse_node_pairs(self, node_features, edge_index, edge_features, aux_info, batch):
+        """Fuse node pair features with edge information."""
+        # Extract node pairs
+        start_nodes = node_features[edge_index[0]]
+        end_nodes = node_features[edge_index[1]]
+        
+        # Learn edge weights from auxiliary information
+        edge_weights = self.fusion['weight_net'](aux_info)
+        
+        # Combine node pair and edge features
+        node_pair_features = torch.cat([
+            start_nodes,      # [num_edges, hidden_dim]
+            end_nodes,       # [num_edges, hidden_dim]
+            edge_features    # [num_edges, out_features_t]
+        ], dim=-1)
+        
+        # Apply learned weights and pool
+        weighted_features = node_pair_features * edge_weights
+        pooled_features = gmp(weighted_features, batch[edge_index[0]])
+        
+        # Project to output space
+        return torch.sigmoid(
+            self.fusion['proj'](
+                self.fusion['norm'](pooled_features)
             )
-            self.link_prediction_head = LinkPrediction(
-                node_dim=embed_dim,
-                hidden_dim=hidden_channels
-            )
-
+        )
+    
+    def _compute_ssl_outputs(self, node_features, edge_index, batch):
+        """Compute self-supervised learning outputs if enabled."""
+        if not self.use_ssl:
+            return {}
+            
+        ssl_outputs = {}
+        
+        # Contrastive learning
+        ssl_outputs['contrastive'] = self.ssl_heads['contrastive'](node_features)
+        
+        # Link prediction
+        edge_pred, edge_labels = self.ssl_heads['link_pred'](
+            node_features, edge_index, batch
+        )
+        ssl_outputs.update({
+            'edge_pred': edge_pred,
+            'edge_labels': edge_labels
+        })
+        
+        return ssl_outputs
+    
     def forward(self, x, edge_index, edge_attr, batch):
         """
+        Forward pass through the spatio-temporal embedding module.
+        
+        Process:
+        1. Encode edge features (temporal + auxiliary)
+        2. Update node representations via Dense GNN
+        3. Fuse node pairs with edge information
+        4. Compute SSL outputs if enabled
+        
         Args:
             x: Node features [num_nodes, hidden_dim]
             edge_index: Edge indices [2, num_edges]
             edge_attr: (time_attr, aux_info, pos)
             batch: Batch indices [num_nodes]
+            
+        Returns:
+            node_features: Updated node features
+            fused_features: Node pair fusion results
+            ssl_outputs: Self-supervised learning outputs (if enabled)
         """
-      
-        # 解析边属性
+        # Unpack edge attributes
         time_attr, aux_info, _ = edge_attr
         
-        # 编码边特征
-        time_feat = self.time_proj(time_attr)  # [num_edges, edge_attr_dim//2]
-        aux_feat = self.aux_proj(aux_info)     # [num_edges, edge_attr_dim//2]
-        edge_features = torch.cat([time_feat, aux_feat], dim=-1)
-        edge_features = self.edge_norm(edge_features)
+        # Process edge features
+        edge_features = self._encode_edge_features(time_attr, aux_info)
         
-        # 通过GNN更新节点特征
-        x = self.conv1(x, edge_index, edge_features)
-        x = self.conv2(x, edge_index, edge_features)
+        # Update node representations
+        node_features = self.gnn(x, edge_index, edge_features)
         
-        # 获取节点对特征
-        start_nodes = x[edge_index[0]]  # [num_edges, hidden_dim]
-        end_nodes = x[edge_index[1]]    # [num_edges, hidden_dim]
+        # Fuse node pairs
+        fused_features = self._fuse_node_pairs(
+            node_features, edge_index, edge_features, aux_info, batch
+        )
         
-        # 从辅助信息学习权重
-        edge_weights = self.weight_net(aux_info)  # [num_edges, 1]
+        # Compute SSL outputs
+        ssl_outputs = self._compute_ssl_outputs(node_features, edge_index, batch)
         
-        # 融合特征
-        node_pair_features = torch.cat([start_nodes, end_nodes], dim=-1)  # [num_edges, hidden_dim*2]
-        weighted_features = node_pair_features * edge_weights  # [num_edges, hidden_dim*2]
-        
-        # 全局池化
-        fusion = gmp(weighted_features, batch[edge_index[0]])  # 使用源节点的batch信息
-        
-        # 最终输出
-        fusion = self.fuse_linear(self.norm(fusion))
-
-        # Self-supervised outputs - generate all SSL outputs if enabled
-        ssl_outputs = {}
-        if self.ssl_mode != "none":
-            # Contrastive learning representation
-            contrastive_repr = self.contrastive_head(x)
-            ssl_outputs['contrastive'] = contrastive_repr
-
-            # Link prediction task
-            edge_pred, edge_labels = self.link_prediction_head(x, edge_index, batch)
-            ssl_outputs['edge_pred'] = edge_pred
-            ssl_outputs['edge_labels'] = edge_labels
-
-        return x, torch.sigmoid(fusion), ssl_outputs
+        return node_features, fused_features, ssl_outputs

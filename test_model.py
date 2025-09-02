@@ -5,7 +5,8 @@ from models.Traj_Embed import Build_Model
 from config.model_config import ModelConfig
 from Utils.util import cal_traj_loss, cal_location_loss, cal_time_loss, evaluate
 
-def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, device=None):
+def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=128, device=None):
+
     """
     创建一个批次的轨迹图数据
     
@@ -70,7 +71,7 @@ def create_batch_data(batch_size=5, num_nodes=4, time_slots=48, location_dim=8, 
         # 随机选择几个时刻有活动
         active_times = torch.randint(0, 24, (5,), device=device)  # 假设每天有5个活动时刻
         for t in active_times:
-            label[t] = torch.randint(1, location_dim, (1,), device=device)  # 1-7表示位置，0表示无活动
+            label[t] = torch.randint(1, 8, (1,), device=device)  # 1-7表示位置，0表示无活动
         all_labels.append(label)
         
         # 5. 创建position信息
@@ -114,7 +115,7 @@ def test_model(ssl_mode="none"):
         batch_size=5,
         num_nodes=4,
         time_slots=48,
-        location_dim=8,
+        location_dim=128,
         device=device
     )
 
@@ -189,7 +190,7 @@ def test_model(ssl_mode="none"):
             optimizer.step()
 
             print(f"Total Loss: {total_loss.item():.4f}")
-            print(f"Supervised Loss: {supervised_loss.item():.4f}")
+            print(f"Supervised Loss: {torch.mean(supervised_loss).item():.4f}")
             print(f"Accuracy: {accuracy:.4f}")
 
             return True

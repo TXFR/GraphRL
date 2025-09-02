@@ -42,7 +42,7 @@ class Build_Model(nn.Module):
         # Initialize embedding modules
         self.time_embed = Temporal_Embed(
             config.time_in,
-            config.hidden_features,
+            config.hidden_channels,
             config.out_features_t,
             config.t_cls,
             config.dropout_prob
@@ -50,17 +50,18 @@ class Build_Model(nn.Module):
         
         self.location_embed = LocationEmbed(
             config.location_in,
-            config.hidden_features,
+            config.hidden_channels,
             config.out_features_l,
             config.loc_cls_num
         )
         
         self.spatio_tmp_embed = Spatio_Tmp_Embed(
-            config.out_features_l,
-            config.hidden_features,
-            config.st_fuse_num,
-            config.t_l_embed,
-            ssl_mode=self.ssl_mode
+            embed_dim=config.out_features_l,
+            hidden_channels=config.hidden_channels,
+            decoder_dim=config.decoder_dim,
+            out_features_t=config.out_features_t,
+            ssl_mode=self.ssl_mode,
+            gnn_num_layers=config.gnn_num_layers
         )
         
         # Additional components
@@ -69,8 +70,13 @@ class Build_Model(nn.Module):
         self.fuse_linear = nn.Linear(config.decoder_dim, config.decoder_dim)
         
         # Normalization layers
-        self.norm = nn.LayerNorm(config.location_in)
+        self.norm = nn.LayerNorm(config.hours_per_day * config.location_categories)  # t_l_cls的维度
         self.norm_decode = nn.LayerNorm(config.decoder_dim)
+        
+        # Store dimensions for spatio_temp_transfer
+        self.time_dim = config.hours_per_day
+        self.location_categories = config.location_categories
+        self.decoder_dim = config.decoder_dim
 
     def ts_decoder(self, x):
         """
@@ -105,8 +111,8 @@ class Build_Model(nn.Module):
         
         Args:
             t_cls: Time classification logits [batch_size, time_dim]
-            l_cls: Location classification logits [batch_size, location_dim]
-            t_l_cls: Time-location classification logits [batch_size, time_dim]
+            l_cls: Location classification logits [batch_size, location_categories]
+            t_l_cls: Time-location joint logits [batch_size, time_dim * location_categories]
         Returns:
             Transferred and reshaped tensor [batch_size, hours_per_day, location_categories]
         """
@@ -115,17 +121,18 @@ class Build_Model(nn.Module):
         t_l_cls = t_l_cls.to(device)
         
         # 转换为概率分布
-        t_l_cls = torch.unsqueeze(t_l_cls, dim=-1)
-        t_cls_ = torch.sigmoid(t_cls)
-        l_cls_ = torch.sigmoid(l_cls)[:, 1:]  # 跳过第一个类别
+        t_cls_ = torch.sigmoid(t_cls)  # [batch_size, time_dim]
+        l_cls_ = torch.sigmoid(l_cls)[:, 1:]  # [batch_size, location_categories-1]
         
         # 创建时空概率矩阵
-        t_s_matrix = torch.unsqueeze(t_cls_, dim=-1) @ torch.unsqueeze(l_cls_, dim=1)
-        t_s_matrix = torch.cat([t_l_cls, t_s_matrix], dim=-1)
+        t_s_matrix = torch.unsqueeze(t_cls_, dim=-1) @ torch.unsqueeze(l_cls_, dim=1)  # [batch_size, time_dim, location_categories-1]
         
-        # 解码和重塑
-        x = self.ts_decoder(self.norm(t_s_matrix))
-        x = self.fuse_linear(x)
+        # 处理t_l_cls
+        t_l_cls = torch.sigmoid(t_l_cls)  # [batch_size, decoder_dim]
+        
+        # 解码
+        x = self.ts_decoder(self.norm(t_l_cls))  # [batch_size, decoder_dim]
+        x = self.fuse_linear(x)  # [batch_size, decoder_dim]
         
         # 重塑为最终输出形状
         output = x.reshape(-1, self.hours_per_day, self.location_categories)
